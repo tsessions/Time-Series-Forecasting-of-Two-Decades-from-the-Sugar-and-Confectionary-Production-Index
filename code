@@ -1,0 +1,432 @@
+#This is the source code for this paper. All the data is available on the data branch, given the same names as they were here.
+
+#load libraries
+library(astsa)
+library(readxl)
+library(forecast)
+library(tseries)
+library(vrtest)
+library(zoo)
+library(reshape2)
+library(dplyr)
+library(stats)
+library(tidyverse)
+
+#DATA IMPORT
+sugar_imports <- read_excel("~/Documents/Data Science Projects/Sessions Candy/Data/Table 61 - US Sugar Imports from All Sources.xlsx", 
+    sheet = "Table61b", range = "A6:M20", 
+    col_names = c("Year","October","November","December","January","February",
+                  "March","April","May","June","July","August","September"))
+
+all_fred = read_excel("~/Documents/Data Science Projects/Sessions Candy/Data/fredgraph.xls", range = "A14:E777")
+
+#DATA MANAGEMENT
+
+sugar_melt = melt(sugar_imports, id.vars = "Year") #wide to long
+
+#convert fiscal year to calendar year
+sugar_melt$Year = ifelse(sugar_melt$variable == "October" | sugar_melt$variable =="November" | sugar_melt$variable == "December", sugar_melt$Year - 1, sugar_melt$Year)
+
+#assign month index to month name
+sugar_melt$Month = match(sugar_melt$variable, month.name)
+
+#convert this year and month to a time object for sugar_melt and fred data
+sugar_melt$YearMonth = as.yearmon(sugar_melt$Year + (sugar_melt$Month - 1)/12, "%y %m") #combines separate year and month data into one column
+
+all_fred$YearMonth = as.yearmon(all_fred$observation_date, "%y %m")
+
+#drop the unnecessary columns
+sugar_data = subset(sugar_melt, select = -c(Year,variable,Month)) #drops all columns except yearmon and value
+
+#sort by date
+sugar_data = sugar_data[order(sugar_data$YearMonth), ]
+
+#combine sugar data with fred
+all_data = merge(x = all_fred, y = sugar_data, by = "YearMonth")
+
+#drop unnecessary columns
+all_data = subset(all_data, select = -c(observation_date))
+
+#rename columns to useful names
+all_data = rename(all_data, c("import_price_index" = "IR000_NBD20090601",
+                              "disposable_income" = "DSPIC96",
+                              "sugar_produc_index" = "IPG3113N_NBD20090601",
+                              "sugar_ppi" = "PCU3113131131_NBD20090601",
+                              "sugar_imports" = "value"))
+
+
+all_data = na.omit(all_data) #only keep rows where we have data from all columns
+
+all_data$sugar_imports = as.numeric(all_data$sugar_imports)
+
+#coerce each variable into time series
+import_price_index_ts = ts(all_data$import_price_index,frequency=12,start=c(2007,10))
+disp_inc_ts = ts(all_data$disposable_income, frequency = 12, start = c(2007,10))
+sugar_produc_ts = ts(all_data$sugar_produc_index, frequency = 12, start = c(2007,10))
+sugar_ppi_ts = ts(all_data$sugar_ppi, frequency = 12, start = c(2007, 10))
+sugar_imports_ts = ts(all_data$sugar_imports, frequency=12, start = c(2007,10))
+
+#TESTING FOR STATIONARITY
+#import price index, independent var
+adf.test(import_price_index_ts, alternative = c("stationary")) #insignificant, so not stationary.
+ipi_d = diff(import_price_index_ts) #differencing
+adf.test(ipi_d,alternative = c("stationary")) #now stationary
+
+#disposable income, independent var
+adf.test(disp_inc_ts, alternative = c("stationary")) #not stationary
+disp_inc_d = diff(disp_inc_ts) #differencing
+adf.test(disp_inc_d, alternative = c("stationary")) #now stationary
+
+#sugar producer price index, independent var
+adf.test(sugar_ppi_ts, alternative = c("stationary")) #not stationary
+sugar_ppi_d = diff(sugar_ppi_ts)
+adf.test(sugar_ppi_d, alternative = c("stationary")) #now stationary
+
+#sugar imports, independent var
+adf.test(sugar_imports_ts, alternative = c("stationary")) #stationary
+
+#sugar production index, INdependent var
+adf.test(sugar_produc_ts, alternative = c("stationary")) #stationary
+
+#BASIC DATA PLOTS
+
+plot(sugar_produc_ts,
+     xlab = "Year",
+     ylab = "Sugar Production Index, Jun 2009=100",
+     main = "Industrial Production Index of \n U.S. Sugar and Confectionery Manufacturing",
+     sub = "Source: Federal Reserve of St. Louis Department of Economic Research",
+     cex.main=.8,
+     cex.sub = .5)
+
+plot(disp_inc_ts,
+     xlab = "Year",
+     ylab = "Billions of Chained 2012 Dollars",
+     main = "Real Disposable Personal Income, \n Seasonally Adjusted Annual Rate",
+     sub = "Source: Federal Reserve of St. Louis Department of Economic Research",
+     cex.main=.8,
+     cex.sub = .5)
+
+plot(import_price_index_ts,
+     xlab = "Year",
+     ylab = "Index, Jun 2009=100",
+     main = "Import Price Index (End Use): \ Green Coffee, Cocoa Beans, and Cane Sugar",
+     sub = "Source: Federal Reserve of St. Louis Department of Economic Research",
+     cex.main=.8,
+     cex.sub = .5)
+
+plot(sugar_ppi_ts,
+     xlab = "Year",
+     ylab = "Index, Jun 2009=100",
+     main = "Producer Price Index of \n Sugar Manufacturing",
+     sub = "Source: Federal Reserve of St. Louis Department of Economic Research",
+     cex.main=.75,
+     cex.sub = .5)
+
+plot(sugar_imports_ts,
+     xlab = "Year",
+     ylab = "Sugar Imports, Metric Tons, Raw Value",
+     main = "U.S. Monthly Sugar Imports from Mexico \n Since Fiscal Year 2008",
+     sub = "Source: USDA Sugar Yearbook Tables",
+     cex.main=.8,
+     cex.sub = .5)
+     
+#CREATE TRAINING DATA WITH 70% OF OBSERVATIONS
+# for production and sugar imports, trim first observation off original dataset to match differencing of the other regressors
+sugar_produc_train = ts(sugar_produc_ts[2:124], 
+                        frequency = 12,
+                        start = c(2007,11))
+sugar_imports_train = sugar_imports_ts[2:124]
+ipi_d_train = ipi_d[1:123]
+disp_inc_d_train = disp_inc_d[1:123]
+sugar_ppi_d_train = sugar_ppi_d[1:123]
+
+#CREATE TEST DATA WITH THE REST
+sugar_produc_test = ts(sugar_produc_ts[125:177],
+                       frequency = 12,
+                       start = c(2018,2))
+sugar_imports_test = sugar_imports_ts[125:177]
+ipi_d_test = ipi_d[124:176]
+disp_inc_d_test = disp_inc_d[124:176]
+sugar_ppi_d_test = sugar_ppi_d[124:176]
+
+#NAIVE METHODS
+#Mean
+sugar_produc_mean=meanf(sugar_produc_train,h=53)
+sqrt(sum((sugar_produc_test-sugar_produc_mean$mean)^2)/53) #22.583
+
+sugar_produc_mean_all = c(sugar_produc_mean$fitted,sugar_produc_mean$mean)
+
+#Naive
+sugar_produc_naive=naive(sugar_produc_train,h=53)
+sqrt(sum((sugar_produc_test-sugar_produc_naive$mean)^2)/53) #15.477
+sugar_produc_naive_all = c(sugar_produc_naive$fitted, sugar_produc_naive$mean)
+
+
+#Drift
+sugar_produc_slope=(sugar_produc_train[123]-sugar_produc_train[1])/122
+sugar_produc_intercept=sugar_produc_train[1]-sugar_produc_slope
+sugar_produc_drift = sugar_produc_intercept + sugar_produc_slope*seq(1,123, 1)
+
+sugar_produc_drift_and_forecast = sugar_produc_intercept + sugar_produc_slope*seq(1,177, 1)
+
+sugar_produc_drift_forecast = sugar_produc_intercept + sugar_produc_slope*123 + sugar_produc_slope*seq(124,176, 1)
+sqrt(sum((sugar_produc_test-sugar_produc_drift_forecast)^2)/53) #17.588
+
+#Naive Forecast Methods for Industrial Production Index of U.S. Sugar and Confectionery Manufacturing on Training Window
+
+plot(index(sugar_produc_ts)[1:123],sugar_produc_drift,
+     col=c("forestgreen"),
+     type = "l",
+     ylim = c(75,200),
+     xlab = "Year",
+     ylab = "Sugar Production Index, Jun 2009=100",
+     main = "Naive Forecast Methods for Industrial Production Index of \n U.S. Sugar and Confectionery Manufacturing on Training Window",
+     sub = "Original Data Source: Federal Reserve of St. Louis Department of Economic Research",
+     cex.main=.8,
+     cex.sub = .5)
+lines(sugar_produc_train)
+lines(sugar_produc_naive$fitted,
+      col=c("red"))
+lines(sugar_produc_mean$fitted,
+      col=c("blue"))
+legend("topleft",lty=1, text.width = 15, col=c("forestgreen","black","red","blue"), 
+       bty = "n", c("Drift", "Training Data","Naive","Mean"))
+       
+ #Naive Forecast Methods for Industrial Production Index of U.S. Sugar and Confectionery Manufacturing on Test Set
+
+plot(index(sugar_produc_test),sugar_produc_drift_forecast,
+     col=c("forestgreen"),
+     type = "l",
+     ylim = c(75,200),
+     xlab = "Year",
+     ylab = "Sugar Production Index, Jun 2009=100",
+     main = "Naive Forecast Methods for Industrial Production Index of \n U.S. Sugar and Confectionery Manufacturing on Testing Set",
+     sub = "Original Data Source: Federal Reserve of St. Louis Department of Economic Research",
+     cex.main=.8,
+     cex.sub = .5)
+lines(sugar_produc_test)
+lines(sugar_produc_naive$mean,
+      col=c("red"))
+lines(sugar_produc_mean$mean,
+      col=c("blue"))
+legend("topleft",lty=1, text.width = 15, col=c("forestgreen","black","red","blue"), 
+       bty = "n", c("Drift", "Testing Data","Naive","Mean"))
+
+#LINEAR MODEL
+#initial testing
+import_price_on_sugar_ppi_imports = lm(import_price_index_ts ~ sugar_ppi_ts + sugar_imports_ts)
+summary(import_price_on_sugar_ppi_imports) #shows high correlation between these variables, so we will still use them in case they help the model, but will be cautious about their true contribution from here on out
+
+summary(import_price_on_sugar_ppi_imports)
+
+#linear regression using differencing time window on all variables
+linear = lm(sugar_produc_train ~ sugar_imports_train +
+              ipi_d_train + disp_inc_d_train + sugar_ppi_d_train)
+
+linear_forecast = forecast(linear, 
+                           h = 53, 
+                           newdata = data.frame(sugar_imports_train = 
+                                                sugar_imports_test,
+                                                ipi_d_train = ipi_d_test,
+                                                disp_inc_d_train =
+                                                  disp_inc_d_test,
+                                                sugar_ppi_d_train =
+                                                  sugar_ppi_d_test))
+
+AIC(linear) # 1,032.845
+
+sqrt(sum((sugar_produc_test-linear_forecast$mean)^2)/53) #24.385
+
+summary(linear)
+
+#----------------------------------------------------------------------------
+#SPECTRAL ANALYSIS WITH REGRESSORS
+
+sugar_produc_spectral_reg <- lm(sugar_produc_train ~ sin_term + cos_term
+                                + sugar_imports_train + ipi_d_train +
+                                  disp_inc_d_train + sugar_ppi_d_train)
+
+AIC(sugar_produc_spectral_reg) #987.3655
+
+sugar_produc_spectral_reg_forecast = forecast(sugar_produc_spectral_reg,
+                                              h = 53,
+                                              newdata = 
+                                                data.frame(sin_term = new_sin,
+                                                           cos_term = new_cos,
+                                                           sugar_imports_train =
+                                                             sugar_imports_test,
+                                                           ipi_d_train = ipi_d_test,
+                                                           disp_inc_d_train =
+                                                             disp_inc_d_test,
+                                                           sugar_ppi_d_train =
+                                                             sugar_ppi_d_test))
+
+sqrt(sum((sugar_produc_test - sugar_produc_spectral_reg_forecast$mean)^2)/53) #27.542
+
+spectral_reg_fitted_ts = ts(spectral_forecast_noreg$fitted, start = c(2007,11),frequency = 12)
+
+plot(spectral_reg_fitted_ts)
+
+summary(sugar_produc_spectral_reg)
+
+#ARIMA ESTIMATION (MANUAL)
+acf(sugar_produc_train) #sig. at lag 1 with seasonality, so sma = 1
+
+acf(sugar_produc_train, type = c("partial")) #sig. at lag 1, so p = 1
+
+sugar_produc_manual_ar = arima(sugar_produc_train, order = c(1,0,1), seasonal = c(1,1,0)) #AIC = 2922.052
+
+AIC(sugar_produc_manual_ar) #708.5146
+
+forecast_sugar_produc_manual_ar = forecast(sugar_produc_manual_ar, h = 53)
+
+sqrt(sum((sugar_produc_test-forecast_sugar_produc_manual_ar$mean)^2)/53) #10.750
+
+#----------------------------------------------------------------------------
+#ARIMA ESTIMATION (USING AUTO ARIMA)
+sugar_produc_auto_ar = auto.arima(sugar_produc_train, trace = T) #order = (1,0,0)(0,0,1)
+
+AIC(sugar_produc_auto_ar) #695.2723
+
+forecast_sugar_produc_auto_ar = forecast(sugar_produc_auto_ar, h = 53)
+
+sqrt(sum((sugar_produc_test-forecast_sugar_produc_auto_ar$mean)^2)/53) #7.393
+
+sugar_auto_ar_all = c(forecast_sugar_produc_auto_ar$fitted,forecast_sugar_produc_auto_ar$mean)
+
+#----------------------------------------------------------------------------
+#ARIMA-X WITH AUTO ARIMA PARAMETERS
+#specify arima-x to order of the auto arima but adding in all regressors
+sugar_produc_arx = arima(sugar_produc_train, 
+                         order = c(1,0,0),
+                         seasonal = list(order = c(0,1,1)), 
+                         xreg = data.frame(sugar_imports_train,
+                                           ipi_d_train,
+                                           disp_inc_d_train,
+                                           sugar_ppi_d_train))
+
+AIC(sugar_produc_arx) #702.8519
+
+forecast_sugar_produc_arx = predict(sugar_produc_arx,
+                                     newxreg =
+                                       data.frame(sugar_imports_train =
+                                                    sugar_imports_test,
+                                                  ipi_d_train =
+                                                    ipi_d_test,
+                                                  disp_inc_d_train =
+                                                    disp_inc_d_test,
+                                                  sugar_ppi_d_train =
+                                                    sugar_ppi_d_test))
+
+sqrt(sum((sugar_produc_test-forecast_sugar_produc_arx$pred)^2)/53) #16.310
+
+#NEURAL NET WITH NO REGRESSORS
+
+sugar_produc_neural = nnetar(sugar_produc_train)
+
+neural_fitted_values = na.omit(sugar_produc_neural$fitted)
+
+neural_forecast = forecast(sugar_produc_neural, h = 53)
+
+sqrt(sum((sugar_produc_test - neural_forecast$mean)^2)/53) #13.345
+
+#---------------------------------------------------------------------------
+#NEURAL NET WITH  REGRESSORS
+
+sugar_produc_neural_regs = nnetar(sugar_produc_train,
+                                  xreg = data.frame(sugar_imports_train,
+                                                    ipi_d_train,
+                                                    disp_inc_d_train,
+                                                    sugar_ppi_d_train))
+
+nnar_fit = na.omit(sugar_produc_neural_regs$fitted)
+neural_reg_all = c(nnar_fit,sugar_produc_neural_regs$mean)
+
+neural_reg_forecast = forecast(sugar_produc_neural_regs,
+                               h=53,
+                               xreg = data.frame(sugar_imports_train =
+                                                   sugar_imports_test,
+                                                 ipi_d_train =
+                                                   ipi_d_test,
+                                                 disp_inc_d_train =
+                                                   disp_inc_d_test,
+                                                 sugar_ppi_d_train =
+                                                   sugar_ppi_d_test))
+
+sqrt(sum((sugar_produc_test - neural_reg_forecast$mean)^2)/53) #16.392
+
+sugar_produc_neural #gave better summary than the summary function when it ran
+
+plot(index(sugar_produc_train),sugar_produc_train,
+     ylab = "Sugar Production Index",
+     xlab = "Year",
+     type = "l",
+     ylim = c(100,200),
+     lwd=2,
+     main = "Top Three Performing Model Classes against Training Dataset",
+     sub = "Metric: Minimized MSE",
+     cex.main=.8,
+     cex.sub = .5)
+lines(forecast_sugar_produc_auto_ar$fitted,
+      col = c("red"))
+lines(neural_reg_forecast$fitted,
+      col = c("blue"))
+lines(sugar_produc_naive$fitted,
+      col = c("forestgreen"))
+legend("topleft",lty=1, text.width = 1,cex=.75, col=c("black","red","blue","forestgreen"), 
+       bty = "n", c("Training Dataset", "ARIMA(1,0,0)(0,0,1) with drift","Neural Net with Regressors","Naive Method"))
+       
+plot(index(sugar_produc_test),sugar_produc_test,
+     ylab = "Sugar Production Index",
+     xlab = "Year",
+     type = "l",
+     lwd=2,
+     main = "Top Three Performing Model Classes against Test Dataset",
+     sub = "Metric: Minimized MSE",
+     cex.main=.8,
+     cex.sub = .5)
+lines(forecast_sugar_produc_auto_ar$mean,
+      col = c("red"))
+lines(neural_reg_forecast$mean,
+      col = c("blue"))
+lines(sugar_produc_naive$mean,
+      col = c("forestgreen"))
+legend("topleft",lty=1, text.width = 1,cex=.75, col=c("black","red","blue","forestgreen"), 
+       bty = "n", c("Test Dataset", "ARIMA(1,0,0)(0,0,1) with drift","Neural Net with Regressors","Naive Method"))
+       
+plot(index(sugar_produc_train),sugar_produc_train,
+     ylab = "Sugar Production Index",
+     xlab = "Year",
+     type = "l",
+     ylim = c(100,200),
+     lwd=2,
+     main = "Top Three Performing Model Classes against Training Dataset",
+     sub = "Metric: Minimized MSE",
+     cex.main=.8,
+     cex.sub = .5)
+lines(forecast_sugar_produc_auto_ar$fitted,
+      col = c("red"))
+lines(neural_reg_forecast$fitted,
+      col = c("blue"))
+lines(sugar_produc_naive$fitted,
+      col = c("forestgreen"))
+legend("topleft",lty=1, text.width = 1,cex=.75, col=c("black","red","blue","forestgreen"), 
+       bty = "n", c("Training Dataset", "ARIMA(1,0,0)(0,0,1) with drift","Neural Net with Regressors","Naive Method"))
+
+plot(index(sugar_produc_ts)[14:177],sugar_produc_ts[14:177],
+     ylab = "Sugar Production Index",
+     xlab = "Year",
+     type = "l",
+     lwd=2,
+     main = "Top Three Performing Model Classes against Full Original Dataset",
+     sub = "Metric: Minimized MSE",
+     cex.main=.8,
+     cex.sub = .5)
+lines(ts(sugar_auto_ar_all[13:176],frequency=12,end=c(2022,6)),
+      col = c("red"))
+lines(ts(neural_reg_all,frequency=12,end=c(2022,6)),
+      col = c("blue"))
+lines(ts(rep(sugar_produc_naive$mean[1],length(neural_reg_all)),frequency=12,end=c(2022,6)),
+      col = c("forestgreen"))
+legend("topleft",lty=1, text.width = 1,cex=.75, col=c("black","red","blue","forestgreen"), 
+       bty = "n", c("Original Dataset", "ARIMA(1,0,0)(0,0,1) with drift","Neural Net with Regressors","Naive Method"))
